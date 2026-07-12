@@ -1,9 +1,5 @@
-
-const makeWASocket = require('@whiskeysockets/baileys').default
-const { DisconnectReason, useMultiFileAuthState } = require('@whiskeysockets/baileys')
-const { Boom } = require('@hapi/boom')
-const qrcode = require('qrcode')
 const http = require('http')
+const https = require('https')
 const OpenAI = require('openai')
 require('dotenv').config()
 
@@ -12,35 +8,9 @@ const openai = new OpenAI({
   apiKey: process.env.OPENROUTER_API_KEY
 })
 
-let qrCodeData = null
-let isReady = false
-
-const server = http.createServer(async (req, res) => {
-  res.writeHead(200, {'Content-Type': 'text/html; charset=utf-8'})
-  if (isReady) {
-    res.end(`<html><body style="background:#000;color:#0f0;text-align:center;font-family:Arial">
-      <h1>FasahaNova connectee!</h1>
-      <p>L agent repond automatiquement</p>
-    </body></html>`)
-  } else if (qrCodeData) {
-    const qrImage = await qrcode.toDataURL(qrCodeData)
-    res.end(`<html><body style="background:#000;color:#fff;text-align:center;font-family:Arial">
-      <h1>Scanner ce QR Code</h1>
-      <p>WhatsApp - Appareils connectes - Scanner</p>
-      <img src="${qrImage}" style="width:300px"/>
-      <p>Actualise si expire</p>
-    </body></html>`)
-  } else {
-    res.end(`<html><body style="background:#000;color:#fff;text-align:center;font-family:Arial">
-      <h1>FasahaNova demarre...</h1>
-      <p>Actualise dans 15 secondes</p>
-    </body></html>`)
-  }
-})
-
-server.listen(process.env.PORT || 3000, () => {
-  console.log('Serveur demarre!')
-})
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN
 
 async function askHermes(message) {
   try {
@@ -49,7 +19,7 @@ async function askHermes(message) {
       messages: [
         {
           role: "system",
-          content: "Tu es FasahaNova, assistante virtuelle pour boutiques mode et beaute au Niger. Tu reponds en francais, tu es polie et efficace."
+          content: "Tu es FasahaNova, assistante virtuelle pour boutiques mode et beaute au Niger. Tu reponds en francais, tu es polie et efficace. Tu aides avec robes, bazins, accessoires, beaute, coiffure, couture."
         },
         { role: "user", content: message }
       ]
@@ -60,57 +30,82 @@ async function askHermes(message) {
   }
 }
 
-async function connectWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info')
-  
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    browser: ['FasahaNova', 'Chrome', '1.0']
+async function sendWhatsAppMessage(to, message) {
+  const data = JSON.stringify({
+    messaging_product: "whatsapp",
+    to: to,
+    type: "text",
+    text: { body: message }
   })
 
-  sock.ev.on('creds.update', saveCreds)
+  const options = {
+    hostname: 'graph.facebook.com',
+    path: `/v18.0/${PHONE_NUMBER_ID}/messages`,
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+      'Content-Type': 'application/json',
+      'Content-Length': data.length
+    }
+  }
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update
-    
-    if (qr) {
-      qrCodeData = qr
-      isReady = false
-      console.log('QR Code pret! Va sur ton URL Render')
-    }
-    
-    if (connection === 'open') {
-      isReady = true
-      qrCodeData = null
-      console.log('FasahaNova connectee a WhatsApp!')
-    }
-    
-    if (connection === 'close') {
-      const code = new Boom(lastDisconnect?.error)?.output?.statusCode
-      if (code !== DisconnectReason.loggedOut) {
-        console.log('Reconnexion...')
-        setTimeout(connectWhatsApp, 5000)
-      }
-    }
-  })
-
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return
-    const msg = messages[0]
-    if (!msg.message || msg.key.fromMe) return
-    
-    const text = msg.message.conversation || 
-      msg.message.extendedTextMessage?.text || ''
-    
-    if (!text) return
-    
-    console.log('Message recu:', text)
-    const response = await askHermes(text)
-    
-    await sock.sendMessage(msg.key.remoteJid, { text: response })
-    console.log('Reponse envoyee!')
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let body = ''
+      res.on('data', (chunk) => body += chunk)
+      res.on('end', () => resolve(body))
+    })
+    req.on('error', reject)
+    req.write(data)
+    req.end()
   })
 }
 
-connectWhatsApp()
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'GET') {
+    const url = new URL(req.url, 'http://localhost')
+    const mode = url.searchParams.get('hub.mode')
+    const token = url.searchParams.get('hub.verify_token')
+    const challenge = url.searchParams.get('hub.challenge')
+
+    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+      console.log('Webhook verifie!')
+      res.writeHead(200)
+      res.end(challenge)
+    } else {
+      res.writeHead(200, {'Content-Type': 'text/html'})
+      res.end('<h1>FasahaNova est active!</h1>')
+    }
+  }
+
+  if (req.method === 'POST') {
+    let body = ''
+    req.on('data', chunk => body += chunk)
+    req.on('end', async () => {
+      try {
+        const data = JSON.parse(body)
+        const entry = data.entry?.[0]
+        const change = entry?.changes?.[0]
+        const message = change?.value?.messages?.[0]
+
+        if (message && message.type === 'text') {
+          const from = message.from
+          const text = message.text.body
+          console.log('Message recu de', from, ':', text)
+
+          const response = await askHermes(text)
+          await sendWhatsAppMessage(from, response)
+          console.log('Reponse envoyee!')
+        }
+      } catch(e) {
+        console.error('Erreur:', e)
+      }
+      res.writeHead(200)
+      res.end('OK')
+    })
+  }
+})
+
+server.listen(process.env.PORT || 3000, () => {
+  console.log('FasahaNova demarre!')
+})
