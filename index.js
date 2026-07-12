@@ -1,11 +1,7 @@
-const { default: makeWASocket, 
-  DisconnectReason, 
-  useMultiFileAuthState 
-} = require('@whiskeysockets/baileys')
-const { Boom } = require('@hapi/boom')
-const OpenAI = require('openai')
-const http = require('http')
+const { Client, LocalAuth } = require('whatsapp-web.js')
 const qrcode = require('qrcode')
+const http = require('http')
+const OpenAI = require('openai')
 require('dotenv').config()
 
 const openai = new OpenAI({
@@ -14,38 +10,32 @@ const openai = new OpenAI({
 })
 
 let qrCodeData = null
+let isReady = false
 
-// Serveur web pour afficher le QR Code
 const server = http.createServer(async (req, res) => {
-  if (qrCodeData) {
+  res.writeHead(200, {'Content-Type': 'text/html'})
+  if (isReady) {
+    res.end(`<html><body style="background:#000;color:#0f0;text-align:center">
+      <h1>✅ FasahaNova est connectée à WhatsApp!</h1>
+      <p>L'agent répond automatiquement aux messages</p>
+    </body></html>`)
+  } else if (qrCodeData) {
     const qrImage = await qrcode.toDataURL(qrCodeData)
-    res.writeHead(200, {'Content-Type': 'text/html'})
-    res.end(`
-      <html>
-        <body style="text-align:center;background:#000;color:#fff">
-          <h1>📱 FasahaNova - Scanner ce QR Code</h1>
-          <p>Ouvre WhatsApp → Appareils connectés → Scanner</p>
-          <img src="${qrImage}" style="width:300px"/>
-          <p>Actualise la page si le QR Code expire</p>
-        </body>
-      </html>
-    `)
+    res.end(`<html><body style="background:#000;color:#fff;text-align:center">
+      <h1>📱 Scanner ce QR Code avec WhatsApp</h1>
+      <p>WhatsApp → Appareils connectés → Scanner</p>
+      <img src="${qrImage}" style="width:300px"/>
+      <p>Actualise si expiré</p>
+    </body></html>`)
   } else {
-    res.writeHead(200, {'Content-Type': 'text/html'})
-    res.end(`
-      <html>
-        <body style="text-align:center;background:#000;color:#fff">
-          <h1>⏳ FasahaNova démarre...</h1>
-          <p>Actualise dans 10 secondes</p>
-        </body>
-      </html>
-    `)
+    res.end(`<html><body style="background:#000;color:#fff;text-align:center">
+      <h1>⏳ FasahaNova démarre...</h1>
+      <p>Actualise dans 15 secondes</p>
+    </body></html>`)
   }
 })
 
-server.listen(process.env.PORT || 3000, () => {
-  console.log('✅ Serveur QR Code démarré sur port 3000')
-})
+server.listen(process.env.PORT || 3000)
 
 async function askHermes(message) {
   const response = await openai.chat.completions.create({
@@ -53,11 +43,7 @@ async function askHermes(message) {
     messages: [
       {
         role: "system",
-        content: `Tu es FasahaNova, une assistante virtuelle 
-professionnelle pour boutiques de mode et beauté au Niger. 
-Tu réponds en français, tu es polie et efficace.
-Tu aides les clients avec : robes, bazins, accessoires, 
-produits de beauté, salon de coiffure, couture.`
+        content: `Tu es FasahaNova, assistante virtuelle pour boutiques mode et beauté au Niger. Tu réponds en français, tu es polie et efficace. Tu aides avec : robes, bazins, accessoires, beauté, coiffure, couture.`
       },
       { role: "user", content: message }
     ]
@@ -65,49 +51,30 @@ produits de beauté, salon de coiffure, couture.`
   return response.choices[0].message.content
 }
 
-async function connectWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState('auth')
-  
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: true
-  })
+const client = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  }
+})
 
-  sock.ev.on('creds.update', saveCreds)
+client.on('qr', (qr) => {
+  qrCodeData = qr
+  console.log('📱 QR Code généré!')
+})
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect, qr } = update
-    
-    if (qr) {
-      qrCodeData = qr
-      console.log('📱 QR Code prêt ! Va sur ton URL Render pour le scanner')
-    }
-    
-    if (connection === 'close') {
-      const shouldReconnect = 
-        new Boom(lastDisconnect?.error)?.output?.statusCode 
-        !== DisconnectReason.loggedOut
-      if (shouldReconnect) connectWhatsApp()
-    } else if (connection === 'open') {
-      qrCodeData = null
-      console.log('✅ FasahaNova connectée à WhatsApp!')
-    }
-  })
+client.on('ready', () => {
+  isReady = true
+  qrCodeData = null
+  console.log('✅ FasahaNova connectée!')
+})
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0]
-    if (!msg.message || msg.key.fromMe) return
-    
-    const text = msg.message.conversation || 
-      msg.message.extendedTextMessage?.text || ''
-    
-    if (!text) return
-    
-    console.log('📩 Message reçu:', text)
-    const response = await askHermes(text)
-    await sock.sendMessage(msg.key.remoteJid, { text: response })
-    console.log('✅ Réponse envoyée!')
-  })
-}
+client.on('message', async (msg) => {
+  if (msg.fromMe) return
+  console.log('📩 Message:', msg.body)
+  const response = await askHermes(msg.body)
+  msg.reply(response)
+  console.log('✅ Réponse envoyée!')
+})
 
-connectWhatsApp()
+client.initialize()()
